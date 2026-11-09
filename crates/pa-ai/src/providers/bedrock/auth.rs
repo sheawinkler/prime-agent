@@ -91,8 +91,8 @@ fn aws_file_paths(lookup: impl Fn(&str) -> Option<String>, home: Option<&Path>) 
 /// The SDK credential chain used by the TS provider: SigV4-skip dummy keys, static env credentials,
 /// the shared credentials file (`AWS_SHARED_CREDENTIALS_FILE` or `~/.aws/credentials`; default or
 /// `AWS_PROFILE` / `options.profile`), then the profile's `credential_process` in the AWS config
-/// file (`AWS_CONFIG_FILE` or `~/.aws/config`). May run the credential process; dropping the future
-/// kills it.
+/// file (`AWS_CONFIG_FILE` or `~/.aws/config`), then its IAM Identity Center (SSO) role via the
+/// token `aws sso login` cached. May run the credential process; dropping the future kills it.
 pub async fn resolve_credentials(profile: Option<&str>) -> Option<AwsCredentials> {
     if std::env::var("AWS_BEDROCK_SKIP_AUTH").as_deref() == Ok("1") {
         return Some(AwsCredentials {
@@ -114,7 +114,8 @@ pub async fn resolve_credentials(profile: Option<&str>) -> Option<AwsCredentials
         .map(std::string::ToString::to_string)
         .or_else(|| env("AWS_PROFILE"))
         .unwrap_or_else(|| "default".to_string());
-    let paths = aws_file_paths(env, pa_types::platform::home_dir().as_deref());
+    let home = pa_types::platform::home_dir();
+    let paths = aws_file_paths(env, home.as_deref());
     if let Some(credentials_path) = &paths.credentials {
         let shared = tokio::fs::read_to_string(credentials_path)
             .await
@@ -125,7 +126,14 @@ pub async fn resolve_credentials(profile: Option<&str>) -> Option<AwsCredentials
         }
     }
     let config = tokio::fs::read_to_string(paths.config?).await.ok()?;
-    crate::providers::bedrock::credential_process::credentials_from_process(&profile, &config).await
+    let process =
+        crate::providers::bedrock::credential_process::credentials_from_process(&profile, &config)
+            .await;
+    if process.is_some() {
+        return process;
+    }
+    crate::providers::bedrock::sso::credentials_from_sso(&profile, &config, env, home.as_deref())
+        .await
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

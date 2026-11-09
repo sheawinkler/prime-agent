@@ -18,8 +18,8 @@ struct CachedCredentials {
     expires_at: Option<u64>,
 }
 
-/// Keyed by profile name and command, so an edited `credential_process` never serves the old
-/// command's credentials.
+/// Keyed by profile name and command (`credential_process`) or by profile and access token (SSO),
+/// so an edited command or a fresh `aws sso login` never serves the old credentials.
 static CACHE: LazyLock<Mutex<HashMap<String, CachedCredentials>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -54,7 +54,7 @@ fn find_command(config: &str, profile: &str) -> Option<String> {
 
 /// Seconds since the Unix epoch for an RFC 3339 timestamp (`Z` or a `±HH:MM` offset); fractional
 /// seconds are ignored.
-fn parse_rfc3339(text: &str) -> Option<u64> {
+pub(crate) fn parse_rfc3339(text: &str) -> Option<u64> {
     let (date, rest) = text.trim().split_once(['T', 't'])?;
     let (time, offset_secs) = if let Some(time) = rest.strip_suffix(['Z', 'z']) {
         (time, 0)
@@ -145,10 +145,37 @@ async fn run(command: &str) -> Option<Vec<u8>> {
     Some(output.stdout)
 }
 
-fn unix_now() -> u64 {
+pub(crate) fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs())
+}
+
+/// The credentials cached under `key` while they stay valid for more than `REFRESH_MARGIN_SECS`.
+pub(crate) fn cached_credentials(key: &str, now: u64) -> Option<AwsCredentials> {
+    let cache = CACHE.lock().ok()?;
+    let entry = cache.get(key)?;
+    entry
+        .expires_at
+        .is_none_or(|expires_at| expires_at > now + REFRESH_MARGIN_SECS)
+        .then(|| entry.credentials.clone())
+}
+
+/// Cache `credentials` under `key` until `expires_at` (`None`: they never expire).
+pub(crate) fn cache_credentials(
+    key: String,
+    credentials: &AwsCredentials,
+    expires_at: Option<u64>,
+) {
+    if let Ok(mut cache) = CACHE.lock() {
+        cache.insert(
+            key,
+            CachedCredentials {
+                credentials: credentials.clone(),
+                expires_at,
+            },
+        );
+    }
 }
 
 /// Credentials from `profile`'s `credential_process` in the AWS config file text, served from the
@@ -160,15 +187,8 @@ pub(crate) async fn credentials_from_process(
     let now = unix_now();
     let command = find_command(config, profile)?;
     let cache_key = format!("{profile}\0{command}");
-    if let Ok(cache) = CACHE.lock() {
-        if let Some(entry) = cache.get(&cache_key) {
-            if entry
-                .expires_at
-                .is_none_or(|expires_at| expires_at > now + REFRESH_MARGIN_SECS)
-            {
-                return Some(entry.credentials.clone());
-            }
-        }
+    if let Some(credentials) = cached_credentials(&cache_key, now) {
+        return Some(credentials);
     }
     let Some((credentials, expiry)) = run(&command).await.as_deref().and_then(parse_output) else {
         tracing::warn!("AWS credential_process printed no usable credentials");
@@ -179,15 +199,7 @@ pub(crate) async fn credentials_from_process(
         Expiry::At(expires_at) => Some(expires_at),
         Expiry::Unknown => Some(now),
     };
-    if let Ok(mut cache) = CACHE.lock() {
-        cache.insert(
-            cache_key,
-            CachedCredentials {
-                credentials: credentials.clone(),
-                expires_at,
-            },
-        );
-    }
+    cache_credentials(cache_key, &credentials, expires_at);
     Some(credentials)
 }
 

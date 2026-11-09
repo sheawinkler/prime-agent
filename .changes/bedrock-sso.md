@@ -1,0 +1,1 @@
+- Bedrock signs in with AWS IAM Identity Center (SSO) profiles, legacy or `sso-session`, using the token `aws sso login` cached, as 0.9.x did.

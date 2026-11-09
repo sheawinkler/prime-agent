@@ -15,6 +15,7 @@ mod events;
 mod eventstream;
 mod goaway;
 mod h2;
+mod sso;
 
 use crate::env_api_keys::get_env_api_key;
 use crate::event_stream::{

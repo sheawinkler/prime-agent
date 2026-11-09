@@ -47,11 +47,11 @@ rustls-native-certs = "0.8"
 webpki-roots = "1"
 tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "handshake", "rustls-tls-native-roots"] }
 http = "1"
+# Bedrock SSO profiles: the AWS SDKs name the `aws sso login` token cache file by the SHA-1 of
+# the session name or start URL; the same version the graph resolves for tokio-tungstenite.
+sha1 = "0.10"
 
 [dev-dependencies]
-# Wire tests only: the WS handshake accept key (SHA-1 of key + GUID); the
-# same version the graph resolves for tokio-tungstenite's rustls chain.
-sha1 = "0.10"
 tempfile = "3"
 rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
