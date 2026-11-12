@@ -178,7 +178,6 @@ impl AgentSessionEngine {
         let auth = pa_core::auth::AuthStorage::create(&self.config.agent_dir);
         let mut registry =
             pa_core::models::ModelRegistry::create(auth, self.config.agent_dir.join("models.json"));
-        registry.load_private_authorization_from_cache();
         let restored = pa_core::models::find_session_model_with_readiness_wait(
             &mut registry,
             &provider,
@@ -272,12 +271,8 @@ impl AgentSessionEngine {
     /// arm or the startup chain.
     fn resolve_registry_model_unchecked(&self) -> anyhow::Result<Model> {
         let auth = pa_core::auth::AuthStorage::create(&self.config.agent_dir);
-        let mut registry =
+        let registry =
             pa_core::models::ModelRegistry::create(auth, self.config.agent_dir.join("models.json"));
-        // A fresh registry gates private Prime Inference models out until the
-        // async authorization refresh runs; adopt the on-disk cache so
-        // create-time resolution can pick the session's private model.
-        registry.load_private_authorization_from_cache();
         let selection = self.current_selection();
         let Some(model_name) = selection.model.as_deref() else {
             if let Some(model) = self.restored_model_resolution(&registry) {
@@ -487,6 +482,21 @@ impl AgentSessionEngine {
         // refreshed: the next call's last-read data is the freshest.
         *slot = Some(registry);
         resolved
+    }
+
+    /// Force-refresh the OAuth credential `provider` rejected, on the store
+    /// the per-call resolution reads (its last read served the rejected call).
+    pub(crate) fn refresh_rejected_request_auth(
+        &self,
+        provider: &str,
+    ) -> Result<(), pa_core::auth::OAuthRefreshFailure> {
+        self.request_auth_registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+            .map_or(Ok(()), |registry| {
+                registry.auth.refresh_rejected_oauth(provider)
+            })
     }
 
     /// Request auth for a model call outside the session stream

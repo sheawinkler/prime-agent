@@ -42,11 +42,10 @@ impl AgentSessionEngine {
             .map_or_else(|| model.clone(), |route| route.target.model);
         if self.config.faux_script.is_none() && self.current_selection().api_key.is_none() {
             let auth = pa_core::auth::AuthStorage::create(&self.config.agent_dir);
-            let mut registry = pa_core::models::ModelRegistry::create(
+            let registry = pa_core::models::ModelRegistry::create(
                 auth,
                 self.config.agent_dir.join("models.json"),
             );
-            registry.load_private_authorization_from_cache();
             if !registry.has_configured_auth(&preflight_model) {
                 let uses_oauth = registry
                     .auth
@@ -153,6 +152,27 @@ impl AgentSessionEngine {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
+        // The auth-retry seam: refresh the rejected credential before the retry.
+        let recovery_engine = engine_weak.clone();
+        let auth_recovery: Option<pa_core::session_engine::auto_retry::AuthRecoveryCallback> =
+            Some(&mut move |message| {
+                let engine = recovery_engine.as_ref().and_then(std::sync::Weak::upgrade);
+                let provider = message.provider.clone();
+                Box::pin(async move {
+                    use pa_core::session_engine::auto_retry::AuthRecovery;
+                    let Some(engine) = engine else {
+                        return AuthRecovery::Retry;
+                    };
+                    let refreshed = tokio::task::spawn_blocking(move || {
+                        engine.refresh_rejected_request_auth(&provider)
+                    })
+                    .await;
+                    match refreshed {
+                        Ok(Err(failure)) => AuthRecovery::EndTurn(failure.to_string()),
+                        Ok(Ok(())) | Err(_) => AuthRecovery::Retry,
+                    }
+                })
+            });
         let park: Option<pa_core::session_engine::provider_park::ParkDecisionCallback> =
             Some(&mut move |message, abort| {
                 let engine_weak = engine_weak.clone();
@@ -584,6 +604,7 @@ impl AgentSessionEngine {
                 },
                 &restore_primary,
                 park,
+                auth_recovery,
             ),
         );
         self.runtime.block_on(restore_subscription.unsubscribe());

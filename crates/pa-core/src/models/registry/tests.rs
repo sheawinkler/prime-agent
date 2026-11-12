@@ -32,10 +32,6 @@ fn in_memory_loads_built_in_catalog() {
     let registry = ModelRegistry::in_memory(auth_with(&serde_json::json!({})));
     assert!(registry.get_error().is_none());
     assert!(!registry.get_all().is_empty());
-    assert!(registry
-        .get_all()
-        .iter()
-        .any(|m| m.id == "internal/glm-5.2-fast"));
 }
 
 /// TS `755-configured-max-tokens.test.ts`: built-in catalog models stay
@@ -153,9 +149,9 @@ fn get_api_key_and_headers_attempts_one_refresh_per_call() {
             &self,
             _provider: &str,
             _credentials: &crate::auth::types::AuthStorageData,
-        ) -> Option<crate::auth::types::AuthCredential> {
+        ) -> Result<crate::auth::types::AuthCredential, String> {
             *self.0.lock().unwrap() += 1;
-            None
+            Err("the token call failed".to_string())
         }
     }
     let dir = tempfile::tempdir().unwrap();
@@ -218,6 +214,56 @@ fn get_api_key_and_headers_attempts_one_refresh_per_call() {
     let resolved = registry.get_api_key_and_headers(&battery, None);
     assert_eq!(resolved.api_key.as_deref(), Some("live-access"));
     assert_eq!(*refreshes.0.lock().unwrap(), 0, "no refresh fires");
+}
+
+/// An expired OAuth credential whose refresh fails, with no other key to
+/// serve, fails the resolution with the re-login sentence (not a keyless
+/// request that surfaces as "No API key").
+#[test]
+fn a_failed_refresh_with_nothing_else_to_serve_fails_with_the_re_login_sentence() {
+    struct RevokedGrant;
+    impl crate::auth::manager::OAuthIntegration for RevokedGrant {
+        fn api_key_for(
+            &self,
+            _provider: &str,
+            _credential: &crate::auth::types::AuthCredential,
+        ) -> Option<String> {
+            None
+        }
+
+        fn refresh(
+            &self,
+            _provider: &str,
+            _credentials: &AuthStorageData,
+        ) -> Result<crate::auth::types::AuthCredential, String> {
+            Err("invalid_grant".to_string())
+        }
+    }
+    let data = AuthStorageData(
+        serde_json::json!({
+            "anthropic": {
+                "type": "oauth", "access": "expired-access", "refresh": "stored-refresh", "expires": 1
+            }
+        })
+        .as_object()
+        .cloned()
+        .unwrap_or_default(),
+    );
+    let mut registry = ModelRegistry::in_memory(AuthStorage::in_memory_without_env(
+        &data,
+        Arc::new(RevokedGrant),
+    ));
+    assert_eq!(
+        registry.get_api_key_and_headers(&model("m", "anthropic"), None),
+        ResolvedRequestAuth {
+            ok: false,
+            error: Some(
+                "Authentication failed for \"anthropic\": the stored credential could not be refreshed (invalid_grant).\n\nRun /login to update credentials."
+                    .to_string()
+            ),
+            ..Default::default()
+        }
+    );
 }
 
 #[test]
@@ -378,13 +424,6 @@ fn a_missing_or_corrupt_cache_falls_back_to_the_bundled_catalog() {
         .iter()
         .any(|model| model.provider == "prime-inference"));
     assert!(registry.get_error().is_some());
-}
-
-#[test]
-fn explicit_private_ids_are_authorized() {
-    let registry = ModelRegistry::in_memory(auth_with(&serde_json::json!({})));
-    let private_model = model("internal/custom-private", "prime-inference");
-    assert!(!registry.is_authorized_private_model(&private_model));
 }
 
 #[test]
@@ -574,11 +613,7 @@ async fn scope_readiness_timeout_keeps_models_available_before_refresh() {
     let mut registry = ModelRegistry::in_memory(auth);
     registry.catalog = Arc::new(pa_models::ModelCatalog::with_urls(None, None, &url, &url));
     let existing = model("internal/existing", "prime-inference");
-    let missing = model("internal/missing", "prime-inference");
-    registry.models = vec![existing.clone(), missing];
-    registry.authorized_private_ids.insert(existing.id.clone());
-    registry.authorized_private_models = vec![existing.clone()];
-    registry.authorized_team_id = Some("team-1".to_string());
+    registry.models = vec![existing.clone()];
     let patterns = vec![
         "prime-inference/internal/existing".to_string(),
         "prime-inference/internal/missing".to_string(),
@@ -592,7 +627,7 @@ async fn scope_readiness_timeout_keeps_models_available_before_refresh() {
     )
     .await;
     assert!(
-        registry.authorized_private_ids.is_empty(),
+        !registry.get_all().contains(&existing),
         "refresh started before timing out"
     );
     assert_eq!(

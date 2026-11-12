@@ -13,6 +13,7 @@ use tokio::sync::Notify;
 use crate::headless_autonomous::{autonomous_runtime_config, HeadlessAutonomous};
 use crate::mode::{AppMode, MissingSubsystem, RunOptions};
 use pa_agent::stream::{LlmContext, StreamFn, StreamRequestOptions};
+use pa_core::session_engine::goal_continuation::{ContinuationTrigger, GoalContinuationDecision};
 use pa_core::session_engine::provider_adapter::{
     json_round_trip, map_thinking_level, stream_once, switchable_stream_fn, ProviderTarget,
 };
@@ -681,7 +682,6 @@ pub(crate) async fn build_headless_engine_with(
     let auth = pa_core::auth::AuthStorage::create(&config.agent_dir);
     let mut registry =
         pa_core::models::ModelRegistry::create(auth, config.agent_dir.join("models.json"));
-    registry.load_private_authorization_from_cache();
     let model = match embedding {
         HeadlessEmbedding::Child(overrides) => match &overrides.lane {
             ChildLane::Real(model) => (**model).clone(),
@@ -983,7 +983,6 @@ fn headless_image_model_router(
             let auth = pa_core::auth::AuthStorage::create(&decide_agent_dir);
             let mut registry =
                 pa_core::models::ModelRegistry::create(auth, decide_agent_dir.join("models.json"));
-            registry.load_private_authorization_from_cache();
             let available: Vec<pa_types::ai::Model> =
                 registry.get_available().into_iter().cloned().collect();
             // Route acceptance uses the same resolved-auth result the arm path
@@ -1027,7 +1026,6 @@ fn headless_image_model_router(
                 let auth = pa_core::auth::AuthStorage::create(&agent_dir);
                 let mut registry =
                     pa_core::models::ModelRegistry::create(auth, agent_dir.join("models.json"));
-                registry.load_private_authorization_from_cache();
                 let resolved_auth = registry
                     .get_api_key_and_headers(&resolved.model, resolved.model.headers.as_ref());
                 let target = pa_core::session_engine::provider_adapter::ProviderTarget {
@@ -1702,18 +1700,32 @@ async fn run_prompts_and_emit(
         {
             continue;
         }
-        if let Some(continuation) = engine.take_owed_goal_continuation().await {
-            goal.publish_goal_update(engine).await;
-            goal.run_queued_turn(
-                engine,
-                &mut boundary,
-                model,
-                api_key.clone(),
-                global_harness_dir.clone(),
-                &continuation,
-            )
-            .await?;
-            continue;
+        // Quiescence settled every descendant: only an owed continuation delivers.
+        match engine
+            .consult_goal_continuation(ContinuationTrigger::OwedRetry, false)
+            .await
+        {
+            GoalContinuationDecision::Minted {
+                message: continuation,
+                ..
+            } => {
+                goal.publish_goal_update(engine).await;
+                goal.run_queued_turn(
+                    engine,
+                    &mut boundary,
+                    model,
+                    api_key.clone(),
+                    global_harness_dir.clone(),
+                    &continuation,
+                )
+                .await?;
+                continue;
+            }
+            // A refused or failed mint can still move the goal (a failed persist fails it).
+            GoalContinuationDecision::NotMinted { .. } => goal.publish_goal_update(engine).await,
+            GoalContinuationDecision::NotOwned
+            | GoalContinuationDecision::NothingOwed
+            | GoalContinuationDecision::Owed => {}
         }
         if autonomous
             .deliver_rlm_continuation(
